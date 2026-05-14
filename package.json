@@ -2,6 +2,7 @@
   "name": "excalidraw-skills",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "build": "esbuild src/index.js --bundle --platform=node --format=esm --alias:@excalidraw/math/ellipse=@excalidraw/math --banner:js='if (!globalThis.navigator) Object.defineProperty(globalThis, \"navigator\", { value: { platform: \"\", userAgent: \"\" }, configurable: true });' --outfile=skill/excalidraw/scripts/excalidraw-skill.js",
