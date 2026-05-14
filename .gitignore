@@ -1,0 +1,9 @@
+.DS_Store
+.env
+.env.*
+node_modules/
+build/
+coverage/
+examples/
+*.log
+*.tar.gz
