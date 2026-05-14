@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   B,
+  COLOR_PALETTE,
   applyPatch,
   createScene,
   describeScene,
@@ -11,6 +12,11 @@ import {
   makeElement,
   summarizeScene
 } from "../skill/excalidraw/scripts/excalidraw-skill.js";
+
+test("exports official Excalidraw color palette", () => {
+  assert.equal(COLOR_PALETTE.orange[1], "#ffd8a8");
+  assert.equal(COLOR_PALETTE.blue[1], "#a5d8ff");
+});
 
 test("makeElement uses official constructors for defaults", () => {
   const rectangle = makeElement("rectangle", {

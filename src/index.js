@@ -14,7 +14,9 @@ import {
   setCustomTextMetricsProvider,
   wrapText
 } from "@excalidraw/element";
-import { getFontString } from "@excalidraw/common";
+import { COLOR_PALETTE, getFontString } from "@excalidraw/common";
+
+export { COLOR_PALETTE };
 
 const DEFAULT_ELEMENT_LIMIT = 80;
 const DEFAULT_TEXT_LIMIT = 120;

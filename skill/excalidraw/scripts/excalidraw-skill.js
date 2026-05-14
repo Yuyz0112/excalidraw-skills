@@ -4533,6 +4533,7 @@ function parseFontSize(fontString) {
 }
 export {
   B2 as B,
+  u as COLOR_PALETTE,
   applyPatch,
   createScene,
   describeScene,
