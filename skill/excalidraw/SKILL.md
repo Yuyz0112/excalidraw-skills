@@ -54,9 +54,10 @@ Import from `scripts/excalidraw-skill.js`.
 - `element.update(fields)`: update an element.
 - `element.delete()`: mark an element deleted.
 - `element.text(textId, text, fields)`: add bound text inside the element.
-- `element.connectTo(targetRefOrId, arrowId, fields)`: connect two elements with a bound arrow.
+- `element.connectTo(targetRefOrId, arrowId, fields)`: connect two elements with a bound arrow. Supports routing via `bend`, `via`, `curve`, `elbow`, and an arrow-bound `label` (see Connections).
 - `drawing.json()`: return the final Excalidraw scene.
 - `summarizeScene(scene)`, `describeScene(scene)`, `formatScene(scene)`, `listElements(scene, query)`, `expandElements(scene, ids, options)`: read large scenes efficiently.
+- `findArrowCrossings(scene, options)`: detect arrows that cut through shapes they are not bound to. Returns `[{ id, crosses: [...] }]`. Use it to validate routing (see Connections / Validation).
 
 The SDK uses official `@excalidraw/element` constructors and update helpers internally. Prefer SDK methods over hand-writing element internals such as `seed`, `versionNonce`, `boundElements`, `containerId`, or arrow binding fields.
 
@@ -129,6 +130,60 @@ Aliases: `top`, `right`, `bottom`, `left`, `center`, `middle`.
 Prefer side anchors (`right-middle`, `left-middle`, `middle-top`, `middle-bottom`) for flow diagrams. Use corner anchors only when it communicates a specific layout relationship.
 
 Give arrow labels enough room. Increase spacing between nodes, choose anchors deliberately, and add a slight bend to long arrows when it prevents label or line overlap. Keep arrows long enough that direction and label are both readable.
+
+### Arrows Must Not Cross Unrelated Elements
+
+A straight `connectTo` between two non-adjacent nodes will cut through whatever boxes sit between them. This is the most common cause of an ugly diagram. Route around obstacles instead of drawing through them. `connectTo` accepts routing options for this:
+
+- `bend: <number>` — bow the arrow into a smooth arc by offsetting its midpoint perpendicular to the straight line (positive and negative bow opposite ways). Use to slip past a single neighbor.
+- `via: [[x, y], ...]` — explicit world-space waypoints. Use for longer detours that run through the empty gutters between rows/columns.
+- `curve: <bool>` — render as a smooth (rounded) spline. Defaults to `true` when the arrow has waypoints. Set `false` for exact, predictable sharp corners.
+- `elbow: true` — orthogonal right-angle arrow (Excalidraw auto-routes it around its two bound endpoints).
+- `gap: <number>` — binding gap at both ends (default `1`).
+- `label: <string>` (+ optional `labelOptions`) — bind a text label to the arrow. **Prefer this over a free-floating text element.** Excalidraw centres the label on the arrow's midpoint and gaps the line around it, so you never compute a label position. This removes most edge-label layout work.
+
+```js
+a.connectTo(b, "a_b", { label: "reads", labelOptions: { strokeColor: "#868e96", fontSize: 16 } });
+```
+
+```js
+// slip past one box with a gentle arc
+a.connectTo(b, "a_b", { from: "right-middle", to: "left-middle", bend: 70 });
+
+// detour a long connector through the gutter below a row
+dispatch.connectTo(taskSup, "dispatch_task", {
+  from: "left-middle",
+  to: "right-middle",
+  via: [[540, -225], [-120, -225]]
+});
+```
+
+Routing strategy that reads cleanly, in order of preference. Favor flowing, hand-drawn-looking curves over orthogonal pipes — a single sweeping arc reads better than a right-angle Z:
+
+1. **Straight** when the direct line is already clear.
+2. **Bow** (`bend` / a single `via` waypoint, curved) to slip past a neighbor — prefer this generously, even a large arc over a tall box. This is the most hand-drawn-looking detour.
+3. **Multi-point detour** (`via` through the empty gutters between bands/columns) only when no single arc clears. Round the corners with a *large* fillet so the turns sweep rather than snap; step the radius down and fall back to sharp only if even a small fillet would graze a box.
+
+Two cautions when rounding routed arrows:
+
+- A rounded multi-point arrow renders as a Catmull-Rom spline that **bulges past its control points**, especially at tight corners — it can overshoot back into a box the sharp polyline cleared. Verify the *curve*, not just the polyline.
+- When several arrows funnel into the same gutter, spread them onto parallel sub-lanes (offset each by ~16px) so they don't draw on top of each other.
+
+**Always validate routing geometrically — do not eyeball it.** After building or editing a scene, run `findArrowCrossings(scene, options)` and confirm it returns `[]`. It samples curved arrows as splines, skips each arrow's bound endpoints, and uses a spatial-grid broad phase so it stays fast on large scenes.
+
+```js
+import { findArrowCrossings } from "./scripts/excalidraw-skill.js";
+
+// Exclude background swim-lanes/bands — an arrow legitimately sits on top of them.
+const crossings = findArrowCrossings(scene, {
+  isObstacle: (el) => el.type === "rectangle" && !el.id.startsWith("band")
+});
+if (crossings.length) {
+  // re-route the offenders: [{ id, crosses: [shapeId, ...] }]
+}
+```
+
+`examples/generate-symphony.mjs` is a complete worked reference: it keeps the original nodes, re-routes every arrow (straight → bow → gutter detour), spreads shared lanes, softens corners with a self-guarding fillet ladder, binds each edge label to its arrow, and asserts `findArrowCrossings(...) === []`. Reuse that pattern for any dense diagram.
 
 ### Layout
 
@@ -247,5 +302,6 @@ After generating or editing an Excalidraw file:
 
 1. Parse the output JSON.
 2. Run `formatScene()` or `summarizeScene()` and check element counts, bounds, labels, bindings, and arrow points.
-3. For SDK changes, run `npm test`.
-4. For visual changes, inspect the resulting `.excalidraw` file when practical.
+3. **Check arrow routing — always.** Run `findArrowCrossings(scene, { isObstacle })` and require an empty result. This is the single most important validation for any diagram with connectors; a passing read of counts/bounds does not catch arrows tunneling through boxes.
+4. For SDK changes, run `npm test`.
+5. For visual changes, inspect the resulting `.excalidraw` file when practical. A quick way to eyeball geometry headlessly: emit a rough SVG (rectangles + Catmull-sampled arrow polylines) and rasterize it.
