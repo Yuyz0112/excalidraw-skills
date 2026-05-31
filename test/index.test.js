@@ -7,6 +7,7 @@ import {
   createScene,
   describeScene,
   expandElements,
+  findArrowCrossings,
   formatScene,
   listElements,
   makeElement,
@@ -194,6 +195,113 @@ test("element refs can connect explicit 3x3 anchors", () => {
   assert.deepEqual(arrowElement.points, [[0, 0], [100, 120]]);
   assert.equal(arrowElement.startBinding.focus, 1);
   assert.equal(arrowElement.endBinding.focus, -1);
+});
+
+test("connectTo bends into a smooth arc via a midpoint waypoint", () => {
+  const drawing = B();
+  const source = drawing.rect("source", 0, 0, 100, 50);
+  const target = drawing.rect("target", 300, 0, 100, 50);
+
+  const arrow = source.connectTo(target, "arc", { from: "right-middle", to: "left-middle", bend: 60 });
+  const built = drawing.json();
+  const el = built.elements.find((element) => element.id === arrow.id);
+
+  // start (0,0), bowed midpoint, end — bend offsets the midpoint perpendicular.
+  assert.equal(el.points.length, 3);
+  assert.deepEqual(el.points[0], [0, 0]);
+  assert.deepEqual(el.points[2], [200, 0]);
+  assert.equal(el.points[1][0], 100); // midpoint x stays centered
+  assert.equal(el.points[1][1], 60); // bowed down by 60
+  assert.deepEqual(el.roundness, { type: 2 }); // curved by default with waypoints
+});
+
+test("connectTo routes through explicit world-space waypoints", () => {
+  const drawing = B();
+  const source = drawing.rect("source", 0, 0, 100, 50);
+  const target = drawing.rect("target", 300, 0, 100, 50);
+
+  const arrow = source.connectTo(target, "routed", {
+    from: "right-middle",
+    to: "left-middle",
+    via: [[150, -80], [250, -80]],
+    curve: false
+  });
+  const built = drawing.json();
+  const el = built.elements.find((element) => element.id === arrow.id);
+
+  // points are stored relative to the arrow origin (the source anchor 100,25).
+  assert.deepEqual(el.points, [[0, 0], [50, -105], [150, -105], [200, 0]]);
+  assert.equal(el.roundness, null); // curve:false => sharp polyline
+});
+
+test("connectTo binds a label to the arrow itself", () => {
+  const drawing = B();
+  const source = drawing.rect("source", 0, 0, 100, 50);
+  const target = drawing.rect("target", 300, 0, 100, 50);
+
+  source.connectTo(target, "edge", {
+    from: "right-middle",
+    to: "left-middle",
+    label: "starts",
+    labelOptions: { strokeColor: "#868e96" }
+  });
+  const built = drawing.json();
+  const arrow = built.elements.find((element) => element.id === "edge");
+  const labelText = built.elements.find((element) => element.id === "edge_label");
+
+  assert.equal(labelText.type, "text");
+  assert.equal(labelText.text, "starts");
+  assert.equal(labelText.containerId, "edge");
+  assert.equal(labelText.strokeColor, "#868e96");
+  assert.deepEqual(arrow.boundElements, [{ id: "edge_label", type: "text" }]);
+  // label is centred on the arrow's midpoint (arrow spans x 100..300)
+  assert.ok(Math.abs(labelText.x + labelText.width / 2 - 200) < 1);
+});
+
+test("connectTo can produce an orthogonal elbow arrow", () => {
+  const drawing = B();
+  const source = drawing.rect("source", 0, 0, 100, 50);
+  const target = drawing.rect("target", 200, 200, 100, 50);
+
+  const arrow = source.connectTo(target, "elbow", { elbow: true });
+  const built = drawing.json();
+  const el = built.elements.find((element) => element.id === arrow.id);
+
+  assert.equal(el.elbowed, true);
+  assert.equal(el.roundness, null);
+});
+
+test("findArrowCrossings flags arrows that cut through unrelated shapes", () => {
+  const drawing = B();
+  const a = drawing.rect("a", 0, 0, 100, 50);
+  const mid = drawing.rect("mid", 200, 0, 100, 50);
+  const b = drawing.rect("b", 400, 0, 100, 50);
+
+  a.connectTo(b, "straight", { from: "right-middle", to: "left-middle" });
+  a.connectTo(b, "arced", { from: "right-middle", to: "left-middle", via: [[250, -120]] });
+
+  const crossings = findArrowCrossings(drawing.json());
+
+  assert.equal(crossings.length, 1);
+  assert.equal(crossings[0].id, "straight");
+  assert.deepEqual(crossings[0].crosses, ["mid"]);
+});
+
+test("findArrowCrossings ignores bound endpoints and honors isObstacle/margin", () => {
+  const drawing = B();
+  const band = drawing.rect("band", -10, -10, 320, 120); // background lane
+  const a = drawing.rect("a", 0, 0, 100, 50);
+  const b = drawing.rect("b", 200, 0, 100, 50);
+  a.connectTo(b, "a_b", { from: "right-middle", to: "left-middle" });
+
+  // The band contains the whole arrow; excluding it via isObstacle clears it.
+  const withBand = findArrowCrossings(drawing.json());
+  assert.ok(withBand.some((c) => c.id === "a_b" && c.crosses.includes("band")));
+
+  const excluded = findArrowCrossings(drawing.json(), {
+    isObstacle: (el) => el.type === "rectangle" && el.id !== "band"
+  });
+  assert.equal(excluded.length, 0); // a and b are the arrow's bound endpoints
 });
 
 test("describeScene returns agent-friendly nodes and edges", () => {

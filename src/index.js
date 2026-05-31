@@ -52,6 +52,20 @@ export function createScene(options = {}) {
   };
 }
 
+// Ensure a parsed scene fragment carries the required Excalidraw envelope so
+// the builder always writes a file the app accepts (a missing `type`/`version`
+// makes Excalidraw reject the file as invalid).
+function normalizeScene(scene) {
+  return {
+    ...scene,
+    type: scene.type ?? "excalidraw",
+    version: scene.version ?? 2,
+    source: scene.source ?? DEFAULT_SOURCE,
+    appState: scene.appState ?? {},
+    files: scene.files ?? {}
+  };
+}
+
 export function summarizeScene(input, options = {}) {
   const scene = parseScene(input);
   const elements = getVisibleElements(scene.elements);
@@ -161,6 +175,198 @@ export function formatScene(input, options = {}) {
   return formatYamlLike(description);
 }
 
+// Detect arrows that visually cross a shape they are not bound to — the most
+// common cause of an unreadable diagram. Run it after generating or editing a
+// scene to validate arrow routing.
+//
+// Returns only the offenders: `[{ id, crosses: [obstacleId, ...] }, ...]`.
+//
+// Options:
+//   margin       clearance in px to inflate every obstacle by (default 0).
+//   isObstacle   predicate selecting which elements block arrows
+//                (default: rectangle / ellipse / diamond / image). Exclude big
+//                background containers such as swim-lanes/bands here.
+//   curveSamples spline samples per segment for rounded arrows (default 16).
+//   cellSize     spatial-grid cell size for the broad phase (default 256).
+//
+// Performance: obstacles are bucketed into a uniform grid once; each arrow only
+// tests the obstacles in the cells its segments pass through, with a segment/AABB
+// bounding-box reject before the exact Liang-Barsky test. Cost scales with local
+// density, not total element count.
+export function findArrowCrossings(input, options = {}) {
+  const scene = parseScene(input);
+  const margin = options.margin ?? 0;
+  const samples = options.curveSamples ?? 16;
+  const cell = options.cellSize ?? 256;
+  const isObstacle = options.isObstacle ?? isDefaultObstacle;
+  const elements = getVisibleElements(scene.elements);
+
+  const obstacles = [];
+  for (const element of elements) {
+    if (element.type === "arrow" || !isObstacle(element)) {
+      continue;
+    }
+    obstacles.push(obstacleBox(element));
+  }
+  const grid = buildObstacleGrid(obstacles, margin, cell);
+
+  const results = [];
+  for (const element of elements) {
+    if (element.type !== "arrow") {
+      continue;
+    }
+    const path = arrowWorldPath(element, samples);
+    if (path.length < 2) {
+      continue;
+    }
+    const bound = new Set(
+      [element.startBinding?.elementId, element.endBinding?.elementId].filter(Boolean)
+    );
+    const hit = new Set();
+    for (let i = 0; i < path.length - 1; i++) {
+      const p = path[i];
+      const q = path[i + 1];
+      const sMinX = Math.min(p.x, q.x);
+      const sMaxX = Math.max(p.x, q.x);
+      const sMinY = Math.min(p.y, q.y);
+      const sMaxY = Math.max(p.y, q.y);
+      for (const index of queryObstacleGrid(grid, sMinX, sMinY, sMaxX, sMaxY, margin)) {
+        const box = obstacles[index];
+        if (hit.has(box.id) || bound.has(box.id)) {
+          continue;
+        }
+        if (sMaxX < box.minX - margin || sMinX > box.maxX + margin || sMaxY < box.minY - margin || sMinY > box.maxY + margin) {
+          continue;
+        }
+        if (segmentHitsBox(p, q, box, margin)) {
+          hit.add(box.id);
+        }
+      }
+    }
+    if (hit.size) {
+      results.push({ id: element.id, crosses: [...hit] });
+    }
+  }
+  return results;
+}
+
+function isDefaultObstacle(element) {
+  return element.type === "rectangle" || element.type === "ellipse" || element.type === "diamond" || element.type === "image";
+}
+
+function obstacleBox(element) {
+  const x = Number(element.x) || 0;
+  const y = Number(element.y) || 0;
+  const width = Number(element.width) || 0;
+  const height = Number(element.height) || 0;
+  return { id: element.id, minX: x, minY: y, maxX: x + width, maxY: y + height };
+}
+
+// World-space polyline of an arrow, sampled as a spline when it is rounded so
+// the test follows the rendered curve (which bulges past its control points).
+function arrowWorldPath(element, samples) {
+  const ox = Number(element.x) || 0;
+  const oy = Number(element.y) || 0;
+  const control = (element.points ?? []).map(([px, py]) => ({ x: ox + px, y: oy + py }));
+  let path = element.roundness && !element.elbowed && control.length > 2 ? sampleCatmullRom(control, samples) : control;
+  const angle = Number(element.angle) || 0;
+  if (angle) {
+    const cx = ox + (Number(element.width) || 0) / 2;
+    const cy = oy + (Number(element.height) || 0) / 2;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    path = path.map((point) => {
+      const dx = point.x - cx;
+      const dy = point.y - cy;
+      return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+    });
+  }
+  return path;
+}
+
+function sampleCatmullRom(points, samples) {
+  const out = [points[0]];
+  const at = (i) => points[Math.max(0, Math.min(points.length - 1, i))];
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = at(i - 1);
+    const p1 = at(i);
+    const p2 = at(i + 1);
+    const p3 = at(i + 2);
+    for (let s = 1; s <= samples; s++) {
+      const t = s / samples;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      out.push({
+        x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+      });
+    }
+  }
+  return out;
+}
+
+// Liang-Barsky: does segment (p,q) enter the axis-aligned box inflated by margin?
+function segmentHitsBox(p, q, box, margin) {
+  const dx = q.x - p.x;
+  const dy = q.y - p.y;
+  const lower = [-dx, dx, -dy, dy];
+  const upper = [p.x - (box.minX - margin), (box.maxX + margin) - p.x, p.y - (box.minY - margin), (box.maxY + margin) - p.y];
+  let t0 = 0;
+  let t1 = 1;
+  for (let i = 0; i < 4; i++) {
+    if (lower[i] === 0) {
+      if (upper[i] < 0) {
+        return false;
+      }
+      continue;
+    }
+    const r = upper[i] / lower[i];
+    if (lower[i] < 0) {
+      if (r > t0) t0 = r;
+    } else if (r < t1) {
+      t1 = r;
+    }
+  }
+  return t0 < t1;
+}
+
+function buildObstacleGrid(obstacles, margin, cell) {
+  const cells = /* @__PURE__ */ new Map();
+  for (let i = 0; i < obstacles.length; i++) {
+    const box = obstacles[i];
+    const x0 = Math.floor((box.minX - margin) / cell);
+    const x1 = Math.floor((box.maxX + margin) / cell);
+    const y0 = Math.floor((box.minY - margin) / cell);
+    const y1 = Math.floor((box.maxY + margin) / cell);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cy = y0; cy <= y1; cy++) {
+        const key = `${cx},${cy}`;
+        const bucket = cells.get(key);
+        if (bucket) bucket.push(i);
+        else cells.set(key, [i]);
+      }
+    }
+  }
+  return { cells, cell };
+}
+
+function queryObstacleGrid({ cells, cell }, minX, minY, maxX, maxY, margin) {
+  const found = /* @__PURE__ */ new Set();
+  const x0 = Math.floor((minX - margin) / cell);
+  const x1 = Math.floor((maxX + margin) / cell);
+  const y0 = Math.floor((minY - margin) / cell);
+  const y1 = Math.floor((maxY + margin) / cell);
+  for (let cx = x0; cx <= x1; cx++) {
+    for (let cy = y0; cy <= y1; cy++) {
+      const bucket = cells.get(`${cx},${cy}`);
+      if (bucket) {
+        for (const index of bucket) found.add(index);
+      }
+    }
+  }
+  return found;
+}
+
 export function applyPatch(input, patch) {
   const scene = parseScene(input);
   const operations = Array.isArray(patch) ? patch : patch.operations;
@@ -239,7 +445,7 @@ export function updateElement(element, fields) {
 }
 
 export function B(input = {}) {
-  const scene = isScene(input) ? parseScene(input) : createScene(input);
+  const scene = isScene(input) ? normalizeScene(parseScene(input)) : createScene(input);
   const operations = [];
 
   const builder = {
@@ -361,30 +567,48 @@ export function elementRef(builder, id) {
       const {
         from = autoAnchor(source, targetElement),
         to = autoAnchor(targetElement, source),
+        via,
+        bend,
+        curve,
+        elbow,
+        gap = 1,
+        label,
+        labelOptions = {},
         ...arrowFields
       } = fields;
       const sourcePoint = anchorPoint(source, from);
       const targetPoint = anchorPoint(targetElement, to);
+      const waypoints = routeWaypoints(sourcePoint, targetPoint, { via, bend });
+      const worldPoints = [sourcePoint, ...waypoints, targetPoint];
+      // A smooth curve is the default whenever the arrow has waypoints (so
+      // routed arrows read as deliberate arcs, not jagged polylines). Elbow
+      // arrows are orthogonal and never rounded.
+      const rounded = elbow ? false : curve ?? worldPoints.length > 2;
+      const routingFields = pruneUndefined({
+        roundness: rounded ? { type: 2 } : null,
+        elbowed: elbow ? true : void 0
+      });
       const arrow = updateElement(makeElement("arrow", {
         id: arrowId,
         x: sourcePoint.x,
         y: sourcePoint.y,
-        points: [
-          [0, 0],
-          [targetPoint.x - sourcePoint.x, targetPoint.y - sourcePoint.y]
-        ],
+        points: worldPoints.map((point) => [
+          point.x - sourcePoint.x,
+          point.y - sourcePoint.y
+        ]),
         endArrowhead: "arrow",
+        ...routingFields,
         ...arrowFields
       }), {
         startBinding: {
           elementId: source.id,
           focus: bindingFocus(from),
-          gap: 1
+          gap
         },
         endBinding: {
           elementId: targetElement.id,
           focus: bindingFocus(to),
-          gap: 1
+          gap
         }
       });
 
@@ -400,6 +624,31 @@ export function elementRef(builder, id) {
           type: "arrow"
         })
       });
+
+      // Bind a label to the arrow itself. Excalidraw centres it on the path and
+      // gaps the line around it, so the caller never positions a separate text
+      // element. This is the preferred way to label a connection.
+      if (label != null) {
+        const labelId = labelOptions.id ?? `${arrowId}_label`;
+        const labelElement = makeElement("text", {
+          id: labelId,
+          text: String(label),
+          originalText: String(label),
+          textAlign: "center",
+          verticalAlign: "middle",
+          ...labelOptions,
+          containerId: arrowId
+        });
+        const elementsMap = elementsMapFor(builder, [arrow, labelElement]);
+        const position = computeBoundTextPosition(arrow, labelElement, elementsMap);
+        const positionedLabel = position ? updateElement(labelElement, position) : labelElement;
+        builder.add(updateElement(arrow, {
+          boundElements: appendBoundElement(arrow.boundElements, { id: labelId, type: "text" })
+        }));
+        builder.add(positionedLabel);
+        return elementRef(builder, arrowId);
+      }
+
       builder.add(arrow);
       return elementRef(builder, arrowId);
     }
@@ -513,6 +762,40 @@ function autoAnchor(source, target) {
     return dx >= 0 ? "right-middle" : "left-middle";
   }
   return dy >= 0 ? "middle-bottom" : "middle-top";
+}
+
+// Build the intermediate waypoints for a routed arrow. `via` is an explicit
+// list of world-space points the arrow must pass through; `bend` is a shorthand
+// that offsets the midpoint perpendicular to the straight line by the given
+// amount (positive bows one way, negative the other) to arc around obstacles.
+function routeWaypoints(sourcePoint, targetPoint, { via, bend } = {}) {
+  if (via && via.length) {
+    return via.map(toPoint);
+  }
+  if (bend) {
+    const dx = targetPoint.x - sourcePoint.x;
+    const dy = targetPoint.y - sourcePoint.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const normalX = -dy / length;
+    const normalY = dx / length;
+    return [
+      {
+        x: (sourcePoint.x + targetPoint.x) / 2 + normalX * bend,
+        y: (sourcePoint.y + targetPoint.y) / 2 + normalY * bend
+      }
+    ];
+  }
+  return [];
+}
+
+function toPoint(value) {
+  if (Array.isArray(value)) {
+    return { x: Number(value[0]) || 0, y: Number(value[1]) || 0 };
+  }
+  if (value && typeof value === "object") {
+    return { x: Number(value.x) || 0, y: Number(value.y) || 0 };
+  }
+  throw new TypeError("Expected a waypoint as [x, y] or { x, y }.");
 }
 
 function anchorPoint(element, anchor) {
